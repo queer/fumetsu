@@ -9,3 +9,4 @@ fumetsu-*.tar
 /tmp
 /data*
 /.elixir_ls
+/cluster*.sh

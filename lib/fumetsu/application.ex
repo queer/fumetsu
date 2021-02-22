@@ -13,6 +13,7 @@ defmodule Fumetsu.Application do
     topology = Application.get_env :fumetsu, :topology
 
     children = [
+      {Finch, name: Fumetsu.Discord.Finch},
       {Task.Supervisor, name: Fumetsu.Tasker},
       {Cluster.Supervisor, [topology, [name: Fumetsu.ClusterSupervisor]]},
       Fumetsu.Cluster,

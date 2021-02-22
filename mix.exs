@@ -24,8 +24,8 @@ defmodule Fumetsu.MixProject do
     [
       {:horde, "~> 0.8.3"},
       {:libcluster, "~> 3.2"},
-      {:rafted_value, "~> 0.11.1"},
-      {:raft_fleet, "~> 0.10.1"},
+      {:tesla, "~> 1.4"},
+      {:finch, "~> 0.6"},
     ]
   end
 end

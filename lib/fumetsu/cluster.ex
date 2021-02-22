@@ -10,6 +10,7 @@ defmodule Fumetsu.Cluster do
 
   def init(_) do
     :net_kernel.monitor_nodes true
+    Logger.debug "[FUMETSU] [CLUSTER] boot: node: monitor up"
     {:ok, crdt} = DeltaCrdt.start_link(DeltaCrdt.AWLWWMap)
     :ets.new @table, [:named_table, :public, :set, read_concurrency: true]
     :ets.insert @table, {:crdt, crdt}
@@ -33,7 +34,18 @@ defmodule Fumetsu.Cluster do
   end
 
   def get_crdt do
+    :ok = spin_on_table()
     [{:crdt, crdt}] = :ets.lookup @table, :crdt
     crdt
+  end
+
+  defp spin_on_table do
+    case :ets.whereis(@table) do
+      :undefined ->
+        :timer.sleep 50
+        spin_on_table()
+
+      _ -> :ok
+    end
   end
 end
