@@ -48,4 +48,12 @@ defmodule Fumetsu.Cluster do
       _ -> :ok
     end
   end
+
+  def write(k, v) do
+    DeltaCrdt.mutate get_crdt(), :add, [k, v]
+  end
+
+  def read(k) do
+    get_crdt() |> DeltaCrdt.read |> Map.get(k)
+  end
 end

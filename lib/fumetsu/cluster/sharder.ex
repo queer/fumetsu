@@ -17,19 +17,46 @@ defmodule Fumetsu.Cluster.Sharder do
     case Registry.register(Fumetsu.Registry, {:via, :horde, __MODULE__}, true) do
       {:ok, _} ->
         Logger.debug "[FUMETSU] [SHARDER] boot: registered"
-        # Give shards time to migrate
-        # Process.send_after self(), :shard, 1_000
+        # Set up defaults
+        if Cluster.read(:goal) == nil do
+          Logger.debug "[FUMETSU] [SHARDER] boot: default goal"
+          Cluster.write :goal, 0
+        end
+        if Cluster.read(:assigns) == nil do
+          Logger.debug "[FUMETSU] [SHARDER] boot: default assigns"
+          Cluster.write :assigns, MapSet.new()
+        end
+        if Cluster.read(:last_boot) == nil do
+          Logger.debug "[FUMETSU] [SHARDER] boot: default last_boot"
+          Cluster.write :last_boot, :os.system_time(:millisecond)
+        end
+
+        spawn fn ->
+          # Fix unsynced assigns
+          existing_assigns =
+            shards()
+            |> Enum.map(fn {_, pid, _, _} -> GenServer.call pid, :shard_id end)
+            |> MapSet.new
+
+          if not MapSet.equal?(existing_assigns, assigns()) do
+            Logger.warn "[FUMETSU] [SHARDER] assigns: unsynced (node killed?)"
+            Cluster.write :assigns, existing_assigns
+          end
+        end
+
         # Spawn reaper
         :timer.apply_interval 5_000, Kernel, :send, [
           self(),
           :reap,
         ]
+
         # Fetch and cache gateway info every hour
         Process.send_after self(), :get_gateway, 1_000
         :timer.apply_interval 3_600_000, Kernel, :send, [
           self(),
           :get_gateway,
         ]
+
         {:ok, opts}
 
       {:error, {:already_registered, _remote_pid?}} ->
@@ -72,11 +99,12 @@ defmodule Fumetsu.Cluster.Sharder do
       current = length(shards())
       Logger.warn "[FUMETSU] [CLUSTER] reaper: now=#{current}, prev=#{current + diff}"
     end
+
     {:noreply, state}
   end
 
   def handle_info(:get_gateway, state) do
-    Logger.info "[FUMETSU] [SHARDER] updating sharding goals"
+    Logger.info "[FUMETSU] [SHARDER] updating goal"
     %{
       "url" => url,
       "shards" => goal,
@@ -84,15 +112,16 @@ defmodule Fumetsu.Cluster.Sharder do
     } = Discord.gateway()
 
     Logger.info "[FUMETSU] [SHARDER] goal=#{goal}, gateway=#{url}"
-    DeltaCrdt.mutate Cluster.get_crdt(), :add, [:goal, goal]
-    DeltaCrdt.mutate Cluster.get_crdt(), :add, [:gateway, url]
+    Cluster.write :goal, goal
+    Cluster.write :gateway, url
     Logger.info "[FUMETSU] [SHARDER] attempting shard"
     send self(), :shard
     {:noreply, state}
   end
 
   def handle_info(:shard, state) do
-    goal = Keyword.get state, :goal
+    # TODO: Handle reassignments
+    goal = goal()
     Logger.info "[FUMETSU] [SHARDER] goal: #{goal}"
     diff = goal - length(shards())
     Logger.info "[FUMETSU] [SHARDER] diff: #{diff}"
@@ -105,13 +134,28 @@ defmodule Fumetsu.Cluster.Sharder do
     {:noreply, state}
   end
 
-  def handle_info(:state, state) do
-    Logger.debug fn -> "[FUMETSU] [SHARDER] state: #{inspect state, pretty: true}" end
+  def handle_info({:free_id, id}, state) do
+    assigns = MapSet.delete assigns(), id
+    Cluster.write :assigns, assigns
     {:noreply, state}
   end
 
-  def handle_info(:test, state) do
-    {:noreply, state ++ [key: :value]}
+  def handle_call(:assign_id, _from, state) do
+    if :os.system_time(:millisecond) - last_boot() >= 5_500 do
+      goal = goal()
+      assigns = assigns()
+      free_ids = MapSet.difference MapSet.new(0..(goal - 1)), assigns
+      if MapSet.size(free_ids) == 0 do
+        {:reply, {:error, :no_ids}, state}
+      else
+        id = Enum.random free_ids
+        assigns = MapSet.put assigns, id
+        Cluster.write :assigns, assigns
+        {:reply, {:ok, id}, state}
+      end
+    else
+      {:reply, {:error, :too_soon}, state}
+    end
   end
 
   def terminate(reason, _) do
@@ -125,16 +169,33 @@ defmodule Fumetsu.Cluster.Sharder do
   ##########
 
   def goal do
-    Cluster.get_crdt() |> DeltaCrdt.read |> Map.get(:goal)
+    Cluster.read :goal
   end
 
   def gateway do
-    Cluster.get_crdt() |> DeltaCrdt.read |> Map.get(:gateway)
+    Cluster.read :gateway
+  end
+
+  def assigns do
+    Cluster.read :assigns
+  end
+
+  def last_boot do
+    Cluster.read :last_boot
   end
 
   #############
   ## HELPERS ##
   #############
+
+  def assign_id do
+    sharder = await_sharder()
+    GenServer.call sharder, :assign_id
+  end
+
+  def free_id(id) do
+    hypersend {:free_id, id}
+  end
 
   def shards do
     Hypervisor
@@ -153,17 +214,13 @@ defmodule Fumetsu.Cluster.Sharder do
     Fumetsu.Registry
     |> Registry.lookup({:via, :horde, __MODULE__})
     |> case do
-      {sharder, true} ->
-        sharder
+      {sharder, true} -> sharder
+      [{sharder, true} | _] -> sharder
 
       _ ->
         # avoid a thrashing spinlock
         :timer.sleep 50
         await_sharder()
     end
-  end
-
-  def shard do
-    hypersend :shard
   end
 end

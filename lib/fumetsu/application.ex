@@ -6,8 +6,6 @@ defmodule Fumetsu.Application do
   alias Fumetsu.Cluster.Sharder
   require Logger
 
-  @target_shards 2
-
   @impl true
   def start(_type, _args) do
     topology = Application.get_env :fumetsu, :topology
@@ -27,7 +25,7 @@ defmodule Fumetsu.Application do
         spawn fn ->
           # Just move this the fuck out of here so that we don't block
           # application boot forever
-          Hypervisor.boot Sharder, [goal: @target_shards]
+          Hypervisor.boot Sharder, []
         end
         {:ok, pid}
 

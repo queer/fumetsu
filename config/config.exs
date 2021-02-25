@@ -20,5 +20,5 @@ config :fumetsu,
 
 
 config :logger, :console,
-  format: "[$time] $metadata[$level]$levelpad $message\n",
+  format: "$metadata[$level]$levelpad $message\n",
   metadata: [:file, :line]

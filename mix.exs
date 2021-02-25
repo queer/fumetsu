@@ -26,6 +26,8 @@ defmodule Fumetsu.MixProject do
       {:libcluster, "~> 3.2"},
       {:tesla, "~> 1.4"},
       {:finch, "~> 0.6"},
+      {:typed_struct, "~> 0.2.1"},
+      {:gun, "~> 1.3"},
     ]
   end
 end
