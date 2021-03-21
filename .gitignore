@@ -10,3 +10,4 @@ fumetsu-*.tar
 /data*
 /.elixir_ls
 /cluster*.sh
+/generator/node_modules
