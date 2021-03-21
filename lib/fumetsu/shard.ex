@@ -5,6 +5,7 @@ defmodule Fumetsu.Shard do
   alias Fumetsu.{Cluster, Config}
   alias Fumetsu.Cluster.Sharder
   alias __MODULE__.State
+  alias Horde.Registry
   require Logger
 
   ###############
@@ -49,18 +50,26 @@ defmodule Fumetsu.Shard do
   @gateway_qs "/v=8&encoding=etf"
   @ws_timeout 10_000
 
+  @type shard_status() ::
+    :waiting
+    | :connecting
+    | :connected
+
   ###########
   ## STATE ##
   ###########
 
   typedstruct module: State do
     field :id, integer(), default: -1
+    field :limit, integer(), default: -1
     field :cf_ray, String.t() | nil
     field :cf_server, String.t() | nil
     field :trace, term() | nil
     field :conn, term() | nil # TODO: What's the right type?
     field :heartbeat_ref, term() | nil
     field :heartbeat_ack, boolean(), default: false
+    field :guilds, MapSet.t(), default: MapSet.new()
+    field :status, Fumetsu.Shard.shard_status(), default: :waiting
   end
 
   #####################
@@ -79,7 +88,7 @@ defmodule Fumetsu.Shard do
   end
 
   def terminate(_, state) do
-    Logger.warn "[FUMETSU] [SHARD] shard-#{state.id}: terminate: freeing #{state.id}"
+    Logger.warn "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: terminate: freeing #{state.id}"
     Sharder.free_id state.id
     :ok
   end
@@ -88,16 +97,22 @@ defmodule Fumetsu.Shard do
     {:reply, state.id, state}
   end
 
+  def handle_call(:status, _from, state) do
+    {:reply, state.status, state}
+  end
+
+  defp status(shard_pid), do: GenServer.call shard_pid, :status
+
   def handle_info(:await_id, state) do
-    Logger.debug "[FUMETSU] [SHARD] assign: requesting"
+    # Logger.debug "[FUMETSU] [SHARD] assign: requesting"
     case Sharder.assign_id() do
-      {:ok, id} ->
-        Logger.info "[FUMETSU] [SHARD] assigned: #{id}"
+      {:ok, {id, limit}} ->
+        Logger.info "[FUMETSU] [SHARD] #{inspect self()}: assigned: #{id}/#{limit}"
         send self(), :connect
-        {:noreply, %{state | id: id}}
+        {:noreply, %{state | id: id, limit: limit}}
 
       {:error, err} when err in [:too_soon, :no_ids] ->
-        Logger.debug fn -> "[FUMETSU] [SHARD] assign: error: #{inspect err}" end
+        # Logger.debug fn -> "[FUMETSU] [SHARD] assign: error: #{inspect err}" end
         Process.send_after self(), :await_id, 1_000
         {:noreply, state}
     end
@@ -105,7 +120,7 @@ defmodule Fumetsu.Shard do
 
   def handle_info(:connect, state) do
     "wss://" <> gateway = Sharder.gateway()
-    Logger.debug "[FUMETSU] [SHARD] connect: gateway -> #{gateway}"
+    Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit} connect: gateway -> #{gateway}"
     {:ok, worker} =
       gateway
       |> :binary.bin_to_list
@@ -114,21 +129,20 @@ defmodule Fumetsu.Shard do
     {:ok, :http} = :gun.await_up worker, @ws_timeout
     stream = :gun.ws_upgrade worker, @gateway_qs
     await_ws_upgrade worker, stream
-    state = %{state | conn: worker}
-    {:noreply, state}
+    {:noreply, %{state | status: :connecting, conn: worker}}
   end
 
   ##################
   ## GUN MESSAGES ##
   ##################
 
-  def handle_info({:gun_ws, _worker, _stream, {:text, frame}}, %{id: id} = state) do
+  def handle_info({:gun_ws, _worker, _stream, {:text, frame}}, %{id: id, limit: limit} = state) do
     payload = Jason.decode! frame
-    Logger.debug "[FUMETSU] [SHARD] shard-#{id}: recv: op=#{@opcodes[payload["op"]]}"
+    Logger.debug "[FUMETSU] [SHARD] shard-#{id}-#{limit}: recv: op=#{@opcodes[payload["op"]]}"
 
     if payload["s"] do
       # Update seqnum if possible
-      Cluster.write shard_key(id, "seqnum"), payload["s"]
+      Cluster.write shard_key(id, limit, "seqnum"), payload["s"]
     end
 
     case handle_payload(payload["op"], payload["t"], payload["d"], state) do
@@ -167,7 +181,7 @@ defmodule Fumetsu.Shard do
   #######################
 
   def handle_info(:heartbeat, state) do
-    heartbeat = encode_payload @op_heartbeat, nil, Cluster.read(shard_key(state.id, "seqnum"))
+    heartbeat = encode_payload @op_heartbeat, nil, Cluster.read(shard_key(state.id, state.limit, "seqnum"))
     :gun.ws_send state.conn, {:binary, heartbeat}
     {:noreply, state}
   end
@@ -183,34 +197,34 @@ defmodule Fumetsu.Shard do
         :heartbeat
       ]
 
-    state = %{state | heartbeat_ref: heartbeat_ref}
-    Logger.debug fn -> "[FUMETSU] [SHARD] shard-#{state.id}: heartbeat_ref: #{inspect heartbeat_ref}" end
+    state = %{state | heartbeat_ref: heartbeat_ref, status: :connected}
+    Logger.debug fn -> "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: heartbeat_ref: #{inspect heartbeat_ref}" end
 
-    old_session = Cluster.read shard_key(state.id, "session")
+    old_session = Cluster.read shard_key(state.id, state.limit, "session")
     if old_session do
-      old_seq = Cluster.read shard_key(state.id, "seqnum")
-      {:reply, resume(state.id, Sharder.goal(), old_session, old_seq), state}
+      old_seq = Cluster.read shard_key(state.id, state.limit, "seqnum")
+      {:reply, resume(state.id, state.limit, old_session, old_seq), state}
     else
-      {:reply, identify(state.id, Sharder.goal()), state}
+      {:reply, identify(state.id, state.limit), state}
     end
   end
 
   def handle_payload(@op_reconnect, _, _, state) do
-    Logger.warn "[FUMETSU] [SHARD] shard-#{state.id}: reconnect: requested"
+    Logger.warn "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: reconnect: requested"
     {:terminate, state}
   end
 
   def handle_payload(@op_invalid_session, _, _, state) do
-    Logger.warn "[FUMETSU] [SHARD] shard-#{state.id}: invalid session"
+    Logger.warn "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: invalid session"
     {:terminate, state}
   end
 
   def handle_payload(@op_heartbeat_ack, _, _, state) do
-    Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}: heartbeat ack"
+    Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: heartbeat ack"
     {:noreply, state}
   end
 
-  def handle_payload(@op_dispatch, "READY", %{
+  def handle_payload(@op_dispatch, "READY" = t, %{
     "session_id" => session,
     "_trace" => trace,
     "user" => %{
@@ -219,17 +233,60 @@ defmodule Fumetsu.Shard do
       "discriminator" => discrim,
     },
     "guilds" => guilds,
-  },
-  %{id: id} = state) do
+  } = d,
+  %{id: id, limit: limit} = state) do
     guild_ids = guilds |> Enum.map(&Map.get(&1, "id"))
-    Logger.info "[FUMETSU] [SHARD] shard-#{id}: ready: #{username}##{discrim} (#{user_id}) => #{length(guild_ids)} guilds"
-    Cluster.write shard_key(id, "session"), session
-    {:noreply, %{state | trace: trace}}
+    Logger.info "[FUMETSU] [SHARD] shard-#{id}-#{limit}: ready: #{username}##{discrim} (#{user_id}) => #{length(guild_ids)} guilds"
+    Cluster.write shard_key(id, limit, "session"), session
+    case Registry.register(Fumetsu.Registry, {:via, :horde, :"fumetsu:shard:#{id}:#{limit}"}, true) do
+      {:ok, _} ->
+        push_dispatch(nil, t, d, state)
+        {:noreply, %{state | trace: trace, guilds: MapSet.new(guild_ids)}}
+
+      {:error, _} ->
+        {:terminate, :cant_register_shard}
+    end
+  end
+
+  def handle_payload(@op_dispatch, "GUILD_CREATE" = t, %{"id" => id} = d, %{guilds: guilds} = state) do
+    guilds = MapSet.put guilds, id
+    push_dispatch(id, t, d, state)
+    {:noreply, %{state | guilds: guilds}}
+  end
+
+  def handle_payload(@op_dispatch, "GUILD_DELETE" = t, %{"id" => id} = d, %{guilds: guilds} = state) do
+    guilds = MapSet.delete guilds, id
+    push_dispatch(id, t, d, state)
+    {:noreply, %{state | guilds: guilds}}
+  end
+
+  def handle_payload(@op_dispatch, t, d, state) do
+    push_dispatch(nil, t, d, state)
+    {:noreply, state}
   end
 
   def handle_payload(op, t, _d, state) do
-    Logger.warn "[FUMETSU] [SHARD] shard-#{state.id}: unhandled op: #{@opcodes[op]} + #{t}"
+    Logger.warn "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: unhandled op: #{@opcodes[op]} + #{t}"
     {:noreply, state}
+  end
+
+  defp push_dispatch(guild_id, t, _d, state) do
+    spawn fn ->
+      if guild_id && Sharder.resharding?() do
+        goal = Sharder.goal()
+        shard_id_for = rem (String.to_integer(guild_id) >>> 22), goal
+        shard_for = Sharder.shard(shard_id_for, goal)
+        if Sharder.resharding?() and status(shard_for) == :connected do
+          Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: recv'd event for replacement shard, dropping."
+        else
+          Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: recv'd event: #{t}"
+          # TODO: Push data
+        end
+      else
+        Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: recv'd event: #{t}"
+        # TODO: Push data
+      end
+    end
   end
 
   ###########
@@ -257,15 +314,12 @@ defmodule Fumetsu.Shard do
     end
   end
 
-  defp shard_key(id, key) do
-    goal = Sharder.goal()
-    "shard:#{id}:#{goal}:#{key}"
+  defp shard_key(id, limit, key) do
+    "fumetsu:shard:#{id}:#{limit}:#{key}"
   end
 
   defp identify(id, goal) do
-    intents = 1 <<< 9
-      # 1 <<< 0 # GUILDS
-      # ||| 1 <<< 9 # GUILD_MESSAGES
+    intents = 1 <<< 9 ||| 1 <<< 0
 
     data =
       %{

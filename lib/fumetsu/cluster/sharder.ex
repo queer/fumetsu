@@ -22,6 +22,10 @@ defmodule Fumetsu.Cluster.Sharder do
           Logger.debug "[FUMETSU] [SHARDER] boot: default goal"
           Cluster.write :goal, 0
         end
+        if Cluster.read(:last_goal) == nil do
+          Logger.debug "[FUMETSU] [SHARDER] boot: default last_goal"
+          Cluster.write :last_goal, 0
+        end
         if Cluster.read(:assigns) == nil do
           Logger.debug "[FUMETSU] [SHARDER] boot: default assigns"
           Cluster.write :assigns, MapSet.new()
@@ -29,6 +33,10 @@ defmodule Fumetsu.Cluster.Sharder do
         if Cluster.read(:last_boot) == nil do
           Logger.debug "[FUMETSU] [SHARDER] boot: default last_boot"
           Cluster.write :last_boot, :os.system_time(:millisecond)
+        end
+        if Cluster.read(:reshard) == nil do
+          Logger.debug "[FUMETSU] [SHARDER] boot: default reshard"
+          Cluster.write :reshard, false
         end
 
         spawn fn ->
@@ -38,7 +46,7 @@ defmodule Fumetsu.Cluster.Sharder do
             |> Enum.map(fn {_, pid, _, _} -> GenServer.call pid, :shard_id end)
             |> MapSet.new
 
-          if not MapSet.equal?(existing_assigns, assigns()) do
+          if not MapSet.equal?(existing_assigns, assigns()) and not resharding?() do
             Logger.warn "[FUMETSU] [SHARDER] assigns: unsynced (node killed?)"
             Cluster.write :assigns, existing_assigns
           end
@@ -86,8 +94,10 @@ defmodule Fumetsu.Cluster.Sharder do
 
   def handle_info(:reap, state) do
     shards = shards()
-    diff = length(shards) - goal()
-    if diff > 0 do
+    goal = goal()
+    diff = length(shards) - goal
+    reshard? = resharding?()
+    if diff > 0 and not reshard? do
       Logger.warn "[FUMETSU] [CLUSTER] reaper: diff=#{diff}"
       shards
       |> Enum.take(diff)
@@ -100,6 +110,15 @@ defmodule Fumetsu.Cluster.Sharder do
       Logger.warn "[FUMETSU] [CLUSTER] reaper: now=#{current}, prev=#{current + diff}"
     end
 
+    # If we somehow get stuck in a funny state, free up the shard id in case
+    assigns = assigns()
+    for id <- 0..(goal - 1) do
+      if shard(id, goal) == nil and not MapSet.member?(assigns, id) do
+        send self(), {:free_id, id}
+        Logger.warn "[FUMETSU] [CLUSTER] reaper: freeing blocked id: #{id}/#{goal}"
+      end
+    end
+
     {:noreply, state}
   end
 
@@ -110,23 +129,29 @@ defmodule Fumetsu.Cluster.Sharder do
       "shards" => goal,
       "session_start_limit" => _,
     } = Discord.gateway()
-
+    # TODO: Ensure we have enough sessions
     Logger.info "[FUMETSU] [SHARDER] goal=#{goal}, gateway=#{url}"
+    old_goal = goal()
     Cluster.write :goal, goal
     Cluster.write :gateway, url
+    if old_goal != 0 and last_goal() == 0 do
+      Cluster.write :last_goal, old_goal
+    end
     Logger.info "[FUMETSU] [SHARDER] attempting shard"
     send self(), :shard
     {:noreply, state}
   end
 
   def handle_info(:shard, state) do
-    # TODO: Handle reassignments
     goal = goal()
-    Logger.info "[FUMETSU] [SHARDER] goal: #{goal}"
     diff = goal - length(shards())
-    Logger.info "[FUMETSU] [SHARDER] diff: #{diff}"
+    Logger.info "[FUMETSU] [SHARDER] goal: #{goal}, diff: #{diff}"
+    if diff > 0 and goal != nil and goal > 0 and last_goal() > 0 do
+      Cluster.write :reshard, true
+      Cluster.write :assigns, MapSet.new()
+    end
     if diff > 0 do
-      for _ <- 0..(diff - 1) do
+      for _ <- 0..goal do
         Hypervisor.boot Shard
       end
     end
@@ -141,17 +166,22 @@ defmodule Fumetsu.Cluster.Sharder do
   end
 
   def handle_call(:assign_id, _from, state) do
-    if :os.system_time(:millisecond) - last_boot() >= 5_500 do
+    diff = :os.system_time(:millisecond) - last_boot()
+    if diff >= 5_500 do
+      Cluster.write :last_boot, :os.system_time(:millisecond)
       goal = goal()
       assigns = assigns()
       free_ids = MapSet.difference MapSet.new(0..(goal - 1)), assigns
+      if MapSet.size(free_ids) == 0 and resharding?() do
+        Cluster.write :reshard, false
+      end
       if MapSet.size(free_ids) == 0 do
         {:reply, {:error, :no_ids}, state}
       else
         id = Enum.random free_ids
         assigns = MapSet.put assigns, id
         Cluster.write :assigns, assigns
-        {:reply, {:ok, id}, state}
+        {:reply, {:ok, {id, goal}}, state}
       end
     else
       {:reply, {:error, :too_soon}, state}
@@ -184,6 +214,14 @@ defmodule Fumetsu.Cluster.Sharder do
     Cluster.read :last_boot
   end
 
+  def resharding? do
+    Cluster.read :reshard
+  end
+
+  def last_goal do
+    Cluster.read :last_goal
+  end
+
   #############
   ## HELPERS ##
   #############
@@ -204,6 +242,16 @@ defmodule Fumetsu.Cluster.Sharder do
       {_, _pid, :worker, [Shard | _]} -> true
       _ -> false
     end)
+  end
+
+  def shard(id, limit) do
+    Fumetsu.Registry
+    |> Registry.lookup({:via, :horde, :"fumetsu:shard:#{id}:#{limit}"})
+    |> case do
+      {shard, true} -> shard
+      [{shard, true} | _] -> shard
+      _ -> nil
+    end
   end
 
   def hypersend(msg) do

@@ -56,4 +56,8 @@ defmodule Fumetsu.Cluster do
   def read(k) do
     get_crdt() |> DeltaCrdt.read |> Map.get(k)
   end
+
+  def delete(k) do
+    DeltaCrdt.mutate get_crdt(), :remove, [k]
+  end
 end
