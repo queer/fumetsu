@@ -50,14 +50,14 @@ defmodule Fumetsu.Cluster do
   end
 
   def write(k, v) do
-    DeltaCrdt.mutate get_crdt(), :add, [k, v]
+    DeltaCrdt.put get_crdt(), k, v
   end
 
   def read(k) do
-    get_crdt() |> DeltaCrdt.read |> Map.get(k)
+    get_crdt() |> DeltaCrdt.to_map |> Map.get(k)
   end
 
   def delete(k) do
-    DeltaCrdt.mutate get_crdt(), :remove, [k]
+    DeltaCrdt.delete get_crdt(), k
   end
 end

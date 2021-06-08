@@ -2,7 +2,7 @@ defmodule Fumetsu.Application do
   @moduledoc false
 
   use Application
-  alias Fumetsu.Hypervisor
+  alias Fumetsu.{Config, Hypervisor}
   alias Fumetsu.Cluster.Sharder
   require Logger
 
@@ -13,6 +13,9 @@ defmodule Fumetsu.Application do
     children = [
       {Finch, name: Fumetsu.Discord.Finch},
       {Task.Supervisor, name: Fumetsu.Tasker},
+      {Singyeong.Client, {nil, Singyeong.parse_dsn(Config.singyeong_dsn())}},
+      Singyeong.Producer,
+      Fumetsu.Consumer,
       {Cluster.Supervisor, [topology, [name: Fumetsu.ClusterSupervisor]]},
       Fumetsu.Cluster,
       {Horde.Registry, [name: Fumetsu.Registry, keys: :unique, members: :auto]},

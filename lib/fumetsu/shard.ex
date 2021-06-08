@@ -6,6 +6,7 @@ defmodule Fumetsu.Shard do
   alias Fumetsu.Cluster.Sharder
   alias __MODULE__.State
   alias Horde.Registry
+  alias Singyeong.{Client, Query}
   require Logger
 
   ###############
@@ -68,7 +69,6 @@ defmodule Fumetsu.Shard do
     field :conn, term() | nil # TODO: What's the right type?
     field :heartbeat_ref, term() | nil
     field :heartbeat_ack, boolean(), default: false
-    field :guilds, MapSet.t(), default: MapSet.new()
     field :status, Fumetsu.Shard.shard_status(), default: :waiting
   end
 
@@ -238,26 +238,47 @@ defmodule Fumetsu.Shard do
     guild_ids = guilds |> Enum.map(&Map.get(&1, "id"))
     Logger.info "[FUMETSU] [SHARD] shard-#{id}-#{limit}: ready: #{username}##{discrim} (#{user_id}) => #{length(guild_ids)} guilds"
     Cluster.write shard_key(id, limit, "session"), session
+    Cluster.write shard_key(id, limit, "guilds"), guild_ids
     case Registry.register(Fumetsu.Registry, {:via, :horde, :"fumetsu:shard:#{id}:#{limit}"}, true) do
       {:ok, _} ->
-        push_dispatch(nil, t, d, state)
-        {:noreply, %{state | trace: trace, guilds: MapSet.new(guild_ids)}}
+        {:noreply, %{state | trace: trace}}
 
       {:error, _} ->
         {:terminate, :cant_register_shard}
     end
   end
 
-  def handle_payload(@op_dispatch, "GUILD_CREATE" = t, %{"id" => id} = d, %{guilds: guilds} = state) do
-    guilds = MapSet.put guilds, id
-    push_dispatch(id, t, d, state)
-    {:noreply, %{state | guilds: guilds}}
+  def handle_payload(@op_dispatch, "RESUMED" = t, %{} = d, %{id: id, limit: limit} = state) do
+    case Registry.register(Fumetsu.Registry, {:via, :horde, :"fumetsu:shard:#{id}:#{limit}"}, true) do
+      {:ok, _} ->
+        {:noreply, state}
+
+      {:error, _} ->
+        {:terminate, :cant_register_shard}
+    end
   end
 
-  def handle_payload(@op_dispatch, "GUILD_DELETE" = t, %{"id" => id} = d, %{guilds: guilds} = state) do
-    guilds = MapSet.delete guilds, id
-    push_dispatch(id, t, d, state)
-    {:noreply, %{state | guilds: guilds}}
+  def handle_payload(@op_dispatch, "GUILD_CREATE" = t, %{"id" => id} = d, %{id: id, limit: limit} = state) do
+    guilds = Cluster.read shard_key(id, limit, "guilds")
+    Cluster.write shard_key(id, limit, "guilds"), MapSet.put(guilds, id)
+    push_dispatch id, t, d, state
+    {:noreply, state}
+  end
+
+  def handle_payload(@op_dispatch, "GUILD_UPDATE" = t, %{"id" => id} = d, state) do
+    push_dispatch id, t, d, state
+    {:noreply, state}
+  end
+
+  def handle_payload(@op_dispatch, "GUILD_DELETE" = t, %{"id" => id} = d, %{id: id, limit: limit} = state) do
+    guilds = Cluster.read shard_key(id, limit, "guilds")
+    Cluster.write shard_key(id, limit, "guilds"), MapSet.delete(guilds, id)
+    {:noreply, state}
+  end
+
+  def handle_payload(@op_dispatch, t, %{"guild_id" => guild_id} = d, state) when is_binary(guild_id) do
+    push_dispatch guild_id, t, d, state
+    {:noreply, state}
   end
 
   def handle_payload(@op_dispatch, t, d, state) do
@@ -270,7 +291,7 @@ defmodule Fumetsu.Shard do
     {:noreply, state}
   end
 
-  defp push_dispatch(guild_id, t, _d, state) do
+  defp push_dispatch(guild_id, t, d, state) do
     spawn fn ->
       if guild_id && Sharder.resharding?() do
         goal = Sharder.goal()
@@ -280,11 +301,15 @@ defmodule Fumetsu.Shard do
           Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: recv'd event for replacement shard, dropping."
         else
           Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: recv'd event: #{t}"
-          # TODO: Push data
+          "bot-backend"
+          |> Query.new
+          |> Client.send_msg(%{"t" => t, "d" => d})
         end
       else
         Logger.debug "[FUMETSU] [SHARD] shard-#{state.id}-#{state.limit}: recv'd event: #{t}"
-        # TODO: Push data
+        "bot-backend"
+        |> Query.new
+        |> Client.send_msg(%{"t" => t, "d" => d})
       end
     end
   end
